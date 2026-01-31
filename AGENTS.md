@@ -9,6 +9,35 @@
 ## Core Components (System-Level)
 These include your original components plus the "glue" needed to make RF/EDA + MARL reproducible and scalable.
 
+### Agentic Orchestrator (LLM, OpenAI Agents SDK)
+- Role: translate user specs into an executable optimization plan; sequence stages; manage iteration loops; trigger golden verification; produce final reports.
+- Design rule: the orchestrator **coordinates** optimization but does **not** do numeric search (RL/surrogates/sim services do).
+- Suggested sub-agents (tool-using, role-specialized):
+  - Spec Parser Agent (requirements -> constraints/objectives/frequency plan).
+  - Topology Strategy Agent (restricted grammar + search priors).
+  - Optimization Supervisor Agent (curriculum, budget allocation, fidelity promotion).
+  - Verification Agent (golden sim selection + final signoff report packaging).
+
+### Unified Design IR (Topology + Geometry + Constraints)
+- All agents/services share a strict intermediate representation so circuit + layout stay synchronized.
+- Canonical fields (minimum):
+  - `topology_graph` (ports, components, connections, termination structure)
+  - `component_intents` (e.g., "series L", "shunt C", target value ranges)
+  - `pcell_parameters` (schema-validated params per instance, plus PDK version)
+  - `placement_data` (grid/regions/anchors, orientation, keepouts)
+  - `routing_segments` (nets, segments, layer assignments, via stacks)
+  - `constraints` (DRC rules + electrical constraints + mmWave-specific limits)
+  - `surrogate_models_used` (model ids + training dataset hashes + uncertainty stats)
+  - `extracted_models` (RLGC/S2P per interconnect, coupled models if enabled)
+  - `performance_metrics` (S-params summaries, Q/L/C/R, SRF, area, yield margins)
+
+### Hierarchical Optimization (Topology → Sizing → Layout)
+- Separate orchestration from numeric optimization and separate **discrete topology** decisions from **continuous/discretized sizing** and **layout**.
+- Keep the action space constrained early:
+  - Topology restricted to a grammar (e.g., ladder-only initially).
+  - Geometry discretized / bounded early to avoid combinatorial explosion.
+- Enforce layout validity via **projection/filters** (hard constraints) rather than reward-only penalties.
+
 ### Platform And Architecture
 - Modular backend using microservices, containerized with Docker and runnable via `docker compose`.
 - API layer(s) for service-to-service coordination and external clients (UI, training jobs, batch optimizations).
@@ -40,12 +69,22 @@ These include your original components plus the "glue" needed to make RF/EDA + M
 - Modular pCell library for each passive component type (spiral inductors, MIM/MOM caps, resistors, interconnect).
 
 ### Simulation Stack (Multi-Fidelity)
-- Multi-fidelity evaluation:
-  - Fast analytic / quasi-static models for early training signals.
-  - Mid-level extraction (RLC / 2.5D approximations) for better accuracy.
-  - EM solver integration later (adapter-based; swappable backends).
+- Progressive fidelity evaluation (surrogate-first; golden sims are rare/strategic):
+  - Tier 0 (analytic): ideal/quasi-static circuit models for early training signals.
+  - Tier 1 (SPICE-level): `ngspice`/AC with simple parasitics for sanity and curriculum progression.
+  - Tier 2 (surrogate-extracted): geometry-based, frequency-dependent S2P/RLGC with uncertainty estimates.
+  - Tier 3 (golden EM): selective high-fidelity solver runs for top candidates + active learning updates.
 - Caching/memoization keyed by `(PDK version, layout hash, solver settings, frequency plan)`.
 - Simulation promotion logic: decide when to "pay" for higher fidelity based on uncertainty / novelty / promise.
+
+### Surrogate Modeling + Active Learning (Acceleration Engine)
+- Per-component surrogates (per family): map `(geometry params, stackup, local context features)` -> `S2P(f)` (fixed frequency grid) + uncertainty.
+- Prefer physically meaningful representations: train/predict on `Y` or `Z` parameters; regularize for passivity and stability.
+- mmWave coupling: include neighborhood/context features from placement/routing; optionally add pairwise coupling surrogates (e.g., inductor-inductor).
+- Active learning loop:
+  - During RL/eval, if uncertainty exceeds a threshold (or novelty triggers), enqueue golden sims.
+  - Periodically retrain and version surrogates; persist dataset hashes so results are reproducible.
+  - Penalize uncertainty and enforce passivity to reduce surrogate exploitation.
 
 ### RL Environment And Multi-Agent Design
 - Environment = layout canvas with PDK constraints, ports, and editable regions.
@@ -53,6 +92,16 @@ These include your original components plus the "glue" needed to make RF/EDA + M
 - Action space: pCell placement, parameter tweaks, routing edits, topology edits, constraint repair actions.
 - Multi-agent coordination: role specialization + shared blackboard state + conflict resolution (locking/regions).
 - Reward design: multi-objective (S-params, Q, area, coupling, self-resonance, yield margins) with constraints.
+- Hierarchical RL (recommended default):
+  - Stage 1: Topology Agent (discrete grammar; fast analytic scoring).
+  - Stage 2: Sizing Agent (continuous/discretized params; surrogate S-params).
+  - Stage 3: Layout Agent (grid placement + routing edits; DRC validity enforced as a hard gate).
+  - Training: shared global reward, centralized critic during training, sequential activation (avoid simultaneous "chaos").
+- Reward components (typical):
+  - Passband insertion loss/|S21| error, return loss/|S11| error, stopband attenuation, ripple.
+  - Area and layout complexity penalties (routing/vias/violations).
+  - Uncertainty and sensitivity penalties (perturbation-based robustness).
+  - Hard gating: DRC/connectivity failures reject actions/candidates before reward is computed.
 
 ### Interactive UI
 - Interactive UI that renders the RL environment and shows edits over time (episode playback).
@@ -75,18 +124,22 @@ These include your original components plus the "glue" needed to make RF/EDA + M
 - `layout-service`: gdsfactory-based pCell instantiation, routing utilities, layout hashing, exporting GDS.
 - `rules-service`: constraint checks (DRC-like geometry, connectivity, port validity) and violation reports.
 - `sim-service`: simulation adapters, job submission/execution, caching, result normalization, plotting.
-- `orchestrator`: workflow engine for "generate -> check -> simulate -> score -> persist".
+- `surrogate-service`: surrogate training/inference, dataset/version management, uncertainty reporting, passivity checks.
+- `orchestrator`: agentic control plane (OpenAI Agents SDK) for "spec -> stage -> optimize -> verify -> report".
 - `rl-service`: training/inference runners; policy registry; evaluation harness; rollout workers.
 - `ui`: web app + backend-for-frontend (if needed) for streaming environment state/events.
 - Infra dependencies (Docker Compose): `postgres` (metadata), `prometheus` (metrics), `grafana` (dashboards), `loki` (logs), `tempo` (traces), `otel-collector` (telemetry pipeline), plus optional `redis`/`nats` (queue/events), `minio` (artifacts).
 
 ## Data Model (Minimum Viable)
+- `DesignIR`: canonical design state (topology + geometry + constraints + lineage) used across orchestrator/RL/sim.
 - `PDKVersion`: immutable PDK bundle + semantic version + content hash.
 - `PCell`: name, parameters schema, default params, supported layers/ports.
 - `LayoutRevision`: `(parent_revision_id, pdk_version_id, layout_hash, gds_uri, metadata_json)`.
 - `ConstraintReport`: violations, severities, locations, rule ids; linked to `LayoutRevision`.
 - `SimJob`: solver id, settings, frequency plan, resource request, status, logs pointer.
 - `SimResult`: normalized metrics (S-params summaries, Q, L/C/R, SRF, coupling), raw artifacts uri.
+- `SurrogateModel`: model id, family, frequency grid, training dataset hash, version, calibration metrics.
+- `SurrogateDataset`: content-addressed dataset bundle (params/context/features + responses + provenance).
 - `Episode` / `Step`: actions, observations pointers, rewards, done flags.
 - `PolicyCheckpoint`: model uri + training config + eval scores.
 
@@ -97,6 +150,11 @@ These include your original components plus the "glue" needed to make RF/EDA + M
   - Spiral inductor: target `L(f0)`, maximize `Q(f0)`, constrain `SRF > k*f0`, minimize area.
   - MIM/MOM capacitor: target `C`, minimize loss/series R, constrain density/spacing rules.
   - Simple passive networks: L-match / pi / T networks with constraints on insertion loss and matching.
+
+### Phase 0.5: Minimal Viable v1 (De-Risking Slice)
+- 2–3 order ladder filter (restricted grammar), one spiral family, one MIM/MOM cap family.
+- Surrogate-first evaluation + periodic golden EM; no coupling initially (add later with context features).
+- Sequential Topology → Sizing; heuristic placement first (add layout RL once stable).
 
 ### Phase 1: Deterministic Layout Kernel + pCells
 - Implement pCells with strict param schemas and stable hashing.
